@@ -48,13 +48,18 @@ const ROPE_MAX_RANGE       = 1400;   // px    — max cast distance
 const ROPE_SHORTEN_RATE    = 150;    // px/s  — reel in (W / Z)
 const ROPE_LENGTHEN_RATE   = 170;    // px/s  — let out (S)
 const SWING_FORCE          = 480;    // px/s² — pendulum lateral push
-const GROUND_ACCEL         = 1800;   // px/s²
-const AIR_CONTROL          = 340;    // px/s²
-const MAX_RUN_SPEED        = 720;    // px/s
+const GROUND_ACCEL         = 750;    // px/s²
+const AIR_CONTROL          = 280;    // px/s²
+const MAX_RUN_SPEED        = 275;    // px/s
 const MAX_FALL_SPEED       = 1400;   // px/s  — prevents floor tunnelling
-const JUMP_FORCE           = -430;   // px/s  (negative = up)
-const GROUND_FRICTION      = 0.74;   // per-frame multiplier (dt-scaled)
+const JUMP_MAX_HEIGHT      = 130;    // px    — apex above ground at full jump
+const JUMP_FORCE           = -Math.sqrt(2 * GRAVITY * JUMP_MAX_HEIGHT); // derived from height
+const GROUND_FRICTION      = 0.74;   // per-frame multiplier when coasting (dt-scaled)
+const GROUND_DECEL         = 0.55;   // stronger per-frame multiplier when reversing direction
 const AIR_DAMPING          = 0.982;
+const COYOTE_TIME          = 0.10;   // s — grace period to jump after walking off edge
+const JUMP_BUFFER_TIME     = 0.12;   // s — jump input stays buffered before landing
+const JUMP_CUT_FACTOR      = 0.45;   // vy multiplier on early jump-key release
 const ROPE_RELEASE_DAMPING = 0.82;   // one-shot bleed on rope drop
 const DEATH_Y              = 680;    // world Y — fall through floor respawn
 const PICKUP_RADIUS        = 22;     // px
@@ -325,7 +330,8 @@ let particles    = [];
 let score        = 0;
 let currentAmmo  = START_AMMO;
 let currentRopes = START_ROPES;
-let jumpBuffered = false;
+let jumpBufferTimer = 0;   // counts down; jump fires when > 0 and onGround/coyote
+let coyoteTimer     = 0;   // counts down after leaving ground — still allows jump
 let gameOver     = false;
 let levelWon     = false;
 let totalTime    = 0;   // elapsed seconds (shown on win screen)
@@ -352,10 +358,18 @@ window.addEventListener('keydown', e => {
   if (e.code === 'Space' ||
       (e.code === 'KeyW' && !rope.active) ||
       (e.code === 'KeyZ' && !rope.active)) {
-    jumpBuffered = true;
+    jumpBufferTimer = JUMP_BUFFER_TIME;
   }
 });
-window.addEventListener('keyup',   e => { keys[e.code] = false; });
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  // Variable jump height: cut upward velocity only when ALL jump keys are released.
+  // Checking after setting false, so keys[e.code] is already cleared.
+  if (e.code === 'Space' || e.code === 'KeyW' || e.code === 'KeyZ') {
+    const jumpStillHeld = keys['Space'] || keys['KeyW'] || keys['KeyZ'];
+    if (!jumpStillHeld && player.vy < 0) player.vy *= JUMP_CUT_FACTOR;
+  }
+});
 
 canvas.addEventListener('mousemove', e => {
   const r = canvas.getBoundingClientRect();
@@ -489,8 +503,9 @@ function respawnPlayer() {
   player.vx = 0;      player.vy = 0;
   player.onGround = false;
   player.invTimer = 2.0;   // grace period after respawn
-  rope.active = false;
-  jumpBuffered = false;
+  rope.active     = false;
+  jumpBufferTimer = 0;
+  coyoteTimer     = 0;
   camera.x = 0;
 }
 
@@ -566,11 +581,28 @@ function update(ts) {
 
   } else {
     // Free flight / ground movement
-    if (jumpBuffered && player.onGround) {
-      player.vy    = JUMP_FORCE;
-      player.onGround = false;
+
+    // Coyote time: keep the grace window alive while on ground, count it down in air
+    if (player.onGround) {
+      coyoteTimer = COYOTE_TIME;
+    } else {
+      coyoteTimer = Math.max(0, coyoteTimer - dt);
     }
-    jumpBuffered = false;
+
+    // Keep buffer alive while a jump key is held; otherwise count it down
+    if (keys['Space'] || keys['KeyW'] || keys['KeyZ']) {
+      jumpBufferTimer = JUMP_BUFFER_TIME;
+    } else {
+      jumpBufferTimer = Math.max(0, jumpBufferTimer - dt);
+    }
+
+    // Fire jump if buffer is active and player is on ground or within coyote window
+    if (jumpBufferTimer > 0 && coyoteTimer > 0) {
+      player.vy       = JUMP_FORCE;
+      player.onGround = false;
+      jumpBufferTimer = 0;
+      coyoteTimer     = 0;  // consume coyote so you can't double-jump off the same edge
+    }
 
     const left  = keys['KeyA'] || keys['KeyQ'];
     const right = keys['KeyD'];
@@ -580,7 +612,14 @@ function update(ts) {
 
     if (player.onGround) {
       player.vx = Math.max(-MAX_RUN_SPEED, Math.min(MAX_RUN_SPEED, player.vx));
-      player.vx *= Math.pow(GROUND_FRICTION, dt * 60);
+      if (!left && !right) {
+        // Coasting — standard friction
+        player.vx *= Math.pow(GROUND_FRICTION, dt * 60);
+      } else if ((left && player.vx > 0) || (right && player.vx < 0)) {
+        // Reversing direction — apply stronger deceleration for a snappier feel
+        player.vx *= Math.pow(GROUND_DECEL, dt * 60);
+      }
+      // If pressing in the current direction of motion, no friction — pure acceleration
     } else {
       player.vx *= Math.pow(AIR_DAMPING, dt * 60);
     }
@@ -1210,8 +1249,9 @@ function restartGame() {
   player.shootTimer = 0;
   player.invTimer   = 0;
 
-  rope.active = false;
-  jumpBuffered = false;
+  rope.active     = false;
+  jumpBufferTimer = 0;
+  coyoteTimer     = 0;
   camera.x = 0;
   lastTime = null;
 
