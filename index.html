@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ninja Rope — Side-Scroller</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a14; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { display: block; cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════════════════════════════════
+//  NINJA ROPE — SIDE-SCROLLER
+//
+//  Module layout (search for the section header to jump to it):
+//    § 1  Constants & Config
+//    § 2  Level Data        ← edit here to design levels / add entity types
+//    § 3  Level Loader      ← add a case here when you add a new entity type
+//    § 4  Game State
+//    § 5  Input
+//    § 6  Physics Engine    (movement, rope, AABB collision)
+//    § 7  Update Logic      (enemies, bullets, pickups, camera)
+//    § 8  Renderer          (world-space then screen-space)
+//    § 9  HUD & Overlays
+//    § 10 Bootstrap
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+canvas.width  = 960;
+canvas.height = 600;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 1  CONSTANTS & CONFIG
+// ─────────────────────────────────────────────────────────────────────────────
+const GRAVITY              = 900;    // px/s²
+const PLAYER_SIZE          = 18;     // diameter (px)
+const BULLET_SPEED         = 750;    // px/s  — player bullets
+const SHOOT_COOLDOWN       = 0.22;   // s between shots
+const ENEMY_BULLET_SPEED   = 260;    // px/s  — static-enemy bullets
+const ENEMY_SHOOT_RANGE    = 580;    // px    — static enemy sight distance
+const ENEMY_SHOOT_CD       = 2.6;    // s between enemy shots
+const ROPE_MAX_RANGE       = 1400;   // px    — max cast distance
+const ROPE_SHORTEN_RATE    = 150;    // px/s  — reel in (W / Z)
+const ROPE_LENGTHEN_RATE   = 170;    // px/s  — let out (S)
+const SWING_FORCE          = 480;    // px/s² — pendulum lateral push
+const GROUND_ACCEL         = 1800;   // px/s²
+const AIR_CONTROL          = 340;    // px/s²
+const MAX_RUN_SPEED        = 720;    // px/s
+const MAX_FALL_SPEED       = 1400;   // px/s  — prevents floor tunnelling
+const JUMP_FORCE           = -430;   // px/s  (negative = up)
+const GROUND_FRICTION      = 0.74;   // per-frame multiplier (dt-scaled)
+const AIR_DAMPING          = 0.982;
+const ROPE_RELEASE_DAMPING = 0.82;   // one-shot bleed on rope drop
+const DEATH_Y              = 680;    // world Y — fall through floor respawn
+const PICKUP_RADIUS        = 22;     // px
+
+const START_AMMO  = 20;
+const START_ROPES = 6;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 2  LEVEL DATA
+//
+//  This object is the single source of truth for the level.
+//  It is parsed by loadLevel() at start and on restart.
+//
+//  Supported entity types:
+//    platform        — solid surface; also used as rope anchor
+//    enemy_patrol    — bounces between startX ± patrolRange; contact-damages player
+//    enemy_static    — stationary; shoots bullets at player within range
+//    pickup_ammo     — collected on touch; +10 ammo
+//    pickup_rope     — collected on touch; +3 rope uses
+//    death_zone      — touching respawns player (−1 HP)
+//    goal            — touching triggers "Level Clear"
+//
+//  To add a new type: define it here, add a case in loadLevel(),
+//  then add update + draw logic in §7 and §8.
+// ─────────────────────────────────────────────────────────────────────────────
+const LEVEL_DATA = {
+  worldWidth:  5000,
+  worldHeight: 700,
+  playerSpawn: { x: 80, y: 530 },
+
+  entities: [
+    // ── World boundaries ────────────────────────────────────────────────────
+    { type: 'platform', x: 0,    y: 0,   w: 18,  h: 700 },  // left wall
+    { type: 'platform', x: 4982, y: 0,   w: 18,  h: 700 },  // right wall
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION 1 — Intro / warm-up  (x 0 → 700)
+    // Goal: teach jump + rope basics before first pit
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 0,   y: 560, w: 490, h: 40  },  // opening ground
+    { type: 'platform', x: 150, y: 460, w: 130, h: 18  },  // hop-up shelf
+    { type: 'platform', x: 310, y: 360, w: 110, h: 18  },  // step up
+    { type: 'platform', x: 190, y: 230, w: 140, h: 18  },  // high anchor #1
+    { type: 'platform', x: 440, y: 480, w: 100, h: 18  },  // lip before pit
+
+    { type: 'enemy_patrol', x: 260, y: 540, patrolRange: 180, speed: 70 },
+
+    { type: 'pickup_ammo', x: 175, y: 438 },
+    { type: 'pickup_rope', x: 355, y: 338 },
+
+    // ── PIT 1  (x 490 → 720) ────────────────────────────────────────────────
+    { type: 'death_zone', x: 490, y: 600, w: 240, h: 100 },
+    { type: 'platform',   x: 500, y: 210, w: 120, h: 18  },  // swing anchor
+    { type: 'pickup_rope',x: 535, y: 188 },
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION 2 — First combat  (x 720 → 1400)
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 720,  y: 480, w: 200, h: 18  },
+    { type: 'platform', x: 720,  y: 350, w: 140, h: 18  },  // anchor
+    { type: 'platform', x: 875,  y: 255, w: 120, h: 18  },  // high anchor #2
+    { type: 'platform', x: 960,  y: 560, w: 290, h: 40  },  // ground
+    { type: 'platform', x: 1095, y: 415, w: 100, h: 18  },
+    { type: 'platform', x: 1045, y: 270, w: 130, h: 18  },  // anchor
+
+    { type: 'enemy_patrol', x: 1040, y: 540, patrolRange: 200, speed: 85 },
+    { type: 'enemy_patrol', x: 1165, y: 540, patrolRange: 140, speed: 72 },
+
+    { type: 'pickup_ammo', x: 985,  y: 540 },
+    { type: 'pickup_ammo', x: 1105, y: 393 },
+
+    // ── PIT 2  (x 1250 → 1510) ──────────────────────────────────────────────
+    { type: 'death_zone', x: 1250, y: 600, w: 280, h: 100 },
+    { type: 'platform',   x: 1265, y: 188, w: 120, h: 18  },
+    { type: 'pickup_rope',x: 1300, y: 166 },
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION 3 — Vertical climb  (x 1510 → 2150)
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 1510, y: 560, w: 180, h: 40  },
+    { type: 'platform', x: 1550, y: 440, w: 120, h: 18  },
+    { type: 'platform', x: 1700, y: 330, w: 140, h: 18  },  // anchor
+    { type: 'platform', x: 1645, y: 205, w: 110, h: 18  },  // high anchor
+    { type: 'platform', x: 1865, y: 460, w: 120, h: 18  },
+    { type: 'platform', x: 1955, y: 340, w: 130, h: 18  },  // anchor
+
+    { type: 'enemy_patrol', x: 1565, y: 540, patrolRange: 125, speed: 82 },
+    { type: 'enemy_static', x: 1710, y: 308 },              // guard on shelf
+
+    { type: 'pickup_ammo', x: 1560, y: 418 },
+    { type: 'pickup_ammo', x: 1875, y: 438 },
+
+    // ── PIT 3  (x 2105 → 2380) ──────────────────────────────────────────────
+    { type: 'death_zone', x: 2105, y: 600, w: 295, h: 100 },
+    { type: 'platform',   x: 2120, y: 158, w: 120, h: 18  },
+    { type: 'pickup_rope',x: 2155, y: 136 },
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION 4 — Enemy gauntlet  (x 2380 → 3100)
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 2380, y: 560, w: 500, h: 40  },  // long ground
+    { type: 'platform', x: 2395, y: 428, w: 110, h: 18  },
+    { type: 'platform', x: 2550, y: 345, w: 130, h: 18  },  // anchor
+    { type: 'platform', x: 2735, y: 455, w: 120, h: 18  },
+    { type: 'platform', x: 2885, y: 560, w: 210, h: 40  },
+
+    { type: 'enemy_patrol', x: 2460, y: 540, patrolRange: 200, speed: 98  },
+    { type: 'enemy_patrol', x: 2650, y: 540, patrolRange: 200, speed: 82  },
+    { type: 'enemy_patrol', x: 2825, y: 540, patrolRange: 100, speed: 108 },
+    { type: 'enemy_static', x: 2560, y: 323 },
+
+    { type: 'pickup_ammo', x: 2405, y: 406 },
+    { type: 'pickup_ammo', x: 2715, y: 540 },
+    { type: 'pickup_rope', x: 2561, y: 323 },
+
+    // ── PIT 4  (x 3090 → 3375) ──────────────────────────────────────────────
+    { type: 'death_zone', x: 3090, y: 600, w: 310, h: 100 },
+    { type: 'platform',   x: 3105, y: 148, w: 130, h: 18  },
+    { type: 'pickup_rope',x: 3140, y: 126 },
+    { type: 'pickup_ammo',x: 3200, y: 126 },
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SECTION 5 — High road  (x 3375 → 4230)
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 3375, y: 560, w: 160, h: 40  },
+    { type: 'platform', x: 3400, y: 410, w: 110, h: 18  },
+    { type: 'platform', x: 3545, y: 285, w: 130, h: 18  },  // anchor
+    { type: 'platform', x: 3715, y: 460, w: 120, h: 18  },
+    { type: 'platform', x: 3855, y: 338, w: 130, h: 18  },  // anchor
+    { type: 'platform', x: 4015, y: 560, w: 205, h: 40  },
+    { type: 'platform', x: 4045, y: 435, w: 100, h: 18  },
+    { type: 'platform', x: 4170, y: 305, w: 120, h: 18  },  // anchor
+
+    { type: 'enemy_patrol', x: 3415, y: 540, patrolRange: 115, speed: 102 },
+    { type: 'enemy_static', x: 3555, y: 263 },
+    { type: 'enemy_patrol', x: 4065, y: 540, patrolRange: 155, speed: 112 },
+
+    { type: 'pickup_ammo', x: 3725, y: 438 },
+    { type: 'pickup_ammo', x: 4055, y: 413 },
+    { type: 'pickup_rope', x: 3866, y: 316 },
+
+    // ── PIT 5  (x 4220 → 4470) ──────────────────────────────────────────────
+    { type: 'death_zone', x: 4220, y: 600, w: 280, h: 100 },
+    { type: 'platform',   x: 4230, y: 138, w: 140, h: 18  },
+    { type: 'pickup_rope',x: 4270, y: 116 },
+    { type: 'pickup_ammo',x: 4325, y: 116 },
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // FINAL SECTION  (x 4470 → goal)
+    // ══════════════════════════════════════════════════════════════════════════
+    { type: 'platform', x: 4470, y: 560, w: 512, h: 40  },
+    { type: 'platform', x: 4495, y: 408, w: 110, h: 18  },
+    { type: 'platform', x: 4660, y: 285, w: 130, h: 18  },  // anchor
+    { type: 'platform', x: 4830, y: 435, w: 120, h: 18  },
+
+    { type: 'enemy_patrol', x: 4535, y: 540, patrolRange: 205, speed: 112 },
+    { type: 'enemy_patrol', x: 4715, y: 540, patrolRange: 205, speed: 122 },
+    { type: 'enemy_static', x: 4670, y: 263 },
+
+    { type: 'pickup_ammo', x: 4505, y: 386 },
+    { type: 'pickup_ammo', x: 4840, y: 413 },
+
+    // Goal portal
+    { type: 'goal', x: 4920, y: 458, w: 50, h: 102 },
+  ]
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 3  LEVEL LOADER
+//  Reads LEVEL_DATA.entities and populates runtime arrays.
+//  Add a new case here when you introduce a new entity type.
+// ─────────────────────────────────────────────────────────────────────────────
+let platforms    = [];  // solid collision geometry + rope anchors
+let enemies      = [];
+let pickups      = [];
+let deathZones   = [];
+let goal         = null;
+
+function loadLevel() {
+  platforms  = [];
+  enemies    = [];
+  pickups    = [];
+  deathZones = [];
+  goal       = null;
+
+  for (const e of LEVEL_DATA.entities) {
+    switch (e.type) {
+
+      // ── Solid surface — player walks on it; rope can attach to it ──────────
+      case 'platform':
+        platforms.push({ x: e.x, y: e.y, w: e.w, h: e.h });
+        break;
+
+      // ── Patrol enemy — walks ± patrolRange from start; contact-hurts player ─
+      case 'enemy_patrol':
+        enemies.push({
+          x: e.x, y: e.y,
+          vx: e.speed || 80, vy: 0,
+          hp: 2, maxHp: 2, size: 20,
+          type: 'patrol',
+          startX: e.x,
+          patrolRange: e.patrolRange || 150,
+          onGround: false,
+        });
+        break;
+
+      // ── Static enemy — stays put; shoots bullets at player in range ─────────
+      case 'enemy_static':
+        enemies.push({
+          x: e.x, y: e.y,
+          vx: 0, vy: 0,
+          hp: 3, maxHp: 3, size: 22,
+          type: 'static',
+          startX: e.x,
+          shootTimer: Math.random() * ENEMY_SHOOT_CD,  // stagger first shot
+          onGround: false,
+        });
+        break;
+
+      // ── Ammo pickup — glowing yellow crate (+10 ammo) ──────────────────────
+      case 'pickup_ammo':
+        pickups.push({ type: 'ammo', x: e.x, y: e.y, active: true, bob: 0 });
+        break;
+
+      // ── Rope pickup — glowing green coil (+3 rope uses) ────────────────────
+      case 'pickup_rope':
+        pickups.push({ type: 'rope', x: e.x, y: e.y, active: true, bob: 0 });
+        break;
+
+      // ── Death zone — red void; touching costs 1 HP and triggers respawn ────
+      case 'death_zone':
+        deathZones.push({ x: e.x, y: e.y, w: e.w, h: e.h });
+        break;
+
+      // ── Goal — glowing portal; reaching it wins the level ──────────────────
+      case 'goal':
+        goal = { x: e.x, y: e.y, w: e.w || 50, h: e.h || 90 };
+        break;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 4  GAME STATE
+// ─────────────────────────────────────────────────────────────────────────────
+const SPAWN_X = LEVEL_DATA.playerSpawn.x;
+const SPAWN_Y = LEVEL_DATA.playerSpawn.y;
+
+const player = {
+  x: SPAWN_X, y: SPAWN_Y,
+  vx: 0, vy: 0,
+  onGround: false,
+  hp: 3,
+  shootTimer: 0,
+  invTimer:   0,  // invincibility frames after being hit
+};
+
+// Rope state — anchor is stored in world coordinates
+const rope = { active: false, ax: 0, ay: 0, len: 0 };
+
+// Camera — camera.x is the world-X of the viewport's left edge
+const camera = { x: 0 };
+
+let bullets      = [];  // player projectiles (world coords)
+let enemyBullets = [];  // enemy projectiles  (world coords)
+let particles    = [];
+
+let score        = 0;
+let currentAmmo  = START_AMMO;
+let currentRopes = START_ROPES;
+let jumpBuffered = false;
+let gameOver     = false;
+let levelWon     = false;
+let totalTime    = 0;   // elapsed seconds (shown on win screen)
+let lastTime     = null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 5  INPUT
+// ─────────────────────────────────────────────────────────────────────────────
+const keys  = {};
+const mouse = { x: 0, y: 0, left: false, right: false, rightJustPressed: false };
+
+// mouseWorld converts screen-pixel mouse position → world coordinates.
+// CRITICAL: every aim / rope cast must use mouseWorld, not mouse,
+// so that targeting stays correct when the camera has scrolled.
+const mouseWorld = {
+  get x() { return mouse.x + camera.x; },
+  get y() { return mouse.y; },            // no vertical camera offset
+};
+
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  // Buffer a jump on the leading edge only.
+  // W/Z shorten the rope when it is active, so don't buffer jump then.
+  if (e.code === 'Space' ||
+      (e.code === 'KeyW' && !rope.active) ||
+      (e.code === 'KeyZ' && !rope.active)) {
+    jumpBuffered = true;
+  }
+});
+window.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', e => {
+  if (e.button === 0) mouse.left = true;
+  if (e.button === 2) { mouse.right = true; mouse.rightJustPressed = true; }
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button === 0) mouse.left  = false;
+  if (e.button === 2) mouse.right = false;
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 6  PHYSICS ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+function aabbOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+function rectContains(r, px, py) {
+  return px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h;
+}
+
+// Slab-method ray vs AABB — returns t of nearest intersection or Infinity.
+function rayVsRect(ox, oy, dx, dy, rx, ry, rw, rh) {
+  let tmin = -Infinity, tmax = Infinity;
+  const eps = 1e-8;
+  if (Math.abs(dx) < eps) {
+    if (ox < rx || ox > rx+rw) return Infinity;
+  } else {
+    let t1 = (rx-ox)/dx, t2 = (rx+rw-ox)/dx;
+    if (t1 > t2) [t1,t2] = [t2,t1];
+    tmin = Math.max(tmin,t1); tmax = Math.min(tmax,t2);
+  }
+  if (Math.abs(dy) < eps) {
+    if (oy < ry || oy > ry+rh) return Infinity;
+  } else {
+    let t1 = (ry-oy)/dy, t2 = (ry+rh-oy)/dy;
+    if (t1 > t2) [t1,t2] = [t2,t1];
+    tmin = Math.max(tmin,t1); tmax = Math.min(tmax,t2);
+  }
+  if (tmax < tmin || tmax < 0) return Infinity;
+  return tmin < 0 ? tmax : tmin;
+}
+
+// Cast a rope ray from (ox,oy) toward world target (tx,ty).
+// All coordinates are WORLD-SPACE. Returns true on successful attach.
+function castRope(ox, oy, tx, ty) {
+  if (currentRopes <= 0) return false;       // no rope left
+  const dx = tx-ox, dy = ty-oy;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) return false;
+  const ndx = dx/dist, ndy = dy/dist;
+
+  let bestT = Infinity;
+  for (const p of platforms) {
+    const t = rayVsRect(ox, oy, ndx, ndy, p.x, p.y, p.w, p.h);
+    if (t > 0 && t < bestT && t < ROPE_MAX_RANGE) bestT = t;
+  }
+  if (bestT < Infinity) {
+    rope.active = true;
+    rope.ax  = ox + ndx * bestT;
+    rope.ay  = oy + ndy * bestT;
+    rope.len = bestT;
+    currentRopes--;
+    return true;
+  }
+  return false;
+}
+
+// Push-out AABB collision between player and all platforms.
+// Sets player.onGround when player lands on top of a surface.
+function resolveCollisions() {
+  player.onGround = false;
+  const pw = PLAYER_SIZE, ph = PLAYER_SIZE;
+
+  for (const p of platforms) {
+    if (!aabbOverlap(player.x-pw/2, player.y-ph/2, pw, ph, p.x, p.y, p.w, p.h)) continue;
+
+    const ol  = (player.x - pw/2 + pw) - p.x;          // overlap from left
+    const or_ = (p.x + p.w) - (player.x - pw/2);       // overlap from right
+    const ot  = (player.y - ph/2 + ph) - p.y;           // overlap from top
+    const ob  = (p.y + p.h) - (player.y - ph/2);        // overlap from bottom
+
+    if (Math.min(ot, ob) < Math.min(ol, or_)) {
+      if (ot < ob) {
+        player.y -= ot;
+        if (player.vy > 0) { player.vy = 0; player.onGround = true; }
+      } else {
+        player.y += ob;
+        if (player.vy < 0) player.vy = 0;
+      }
+    } else {
+      if (ol < or_) { player.x -= ol; if (player.vx > 0) player.vx = 0; }
+      else          { player.x += or_; if (player.vx < 0) player.vx = 0; }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 7  UPDATE LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 60 + Math.random() * 180;
+    const life = 0.4 + Math.random() * 0.4;
+    particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+                     life, maxLife: life, color, r: 3 + Math.random() * 4 });
+  }
+}
+
+// Hurt player — no-op if currently invincible
+function hurtPlayer(amt) {
+  if (player.invTimer > 0) return;
+  player.hp       -= amt;
+  player.invTimer  = 1.5;
+  spawnParticles(player.x, player.y, '#00aaff', 8);
+  if (player.hp <= 0) gameOver = true;
+}
+
+// Teleport player back to spawn (used after death-zone contact)
+function respawnPlayer() {
+  player.x = SPAWN_X; player.y = SPAWN_Y;
+  player.vx = 0;      player.vy = 0;
+  player.onGround = false;
+  player.invTimer = 2.0;   // grace period after respawn
+  rope.active = false;
+  jumpBuffered = false;
+  camera.x = 0;
+}
+
+function update(ts) {
+  if (!lastTime) lastTime = ts;
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+
+  // ── Pause on end states — wait for restart key ───────────────────────────
+  if (gameOver || levelWon) {
+    if (keys['Space'] || keys['Enter']) restartGame();
+    draw();
+    requestAnimationFrame(update);
+    return;
+  }
+
+  totalTime += dt;
+
+  // ── Rope casting ─────────────────────────────────────────────────────────
+  // Use mouseWorld (world coordinates) so aiming is correct when scrolled.
+  if (mouse.rightJustPressed) {
+    mouse.rightJustPressed = false;
+    castRope(player.x, player.y, mouseWorld.x, mouseWorld.y);
+  }
+  if (!mouse.right && rope.active) {
+    rope.active = false;
+    player.vx  *= ROPE_RELEASE_DAMPING;
+    player.vy  *= ROPE_RELEASE_DAMPING;
+  }
+
+  // ── Rope length control (W/Z = shorten, S = lengthen) ────────────────────
+  if (rope.active) {
+    if (keys['KeyW'] || keys['KeyZ'])
+      rope.len = Math.max(30,   rope.len - ROPE_SHORTEN_RATE * dt);
+    if (keys['KeyS'])
+      rope.len = Math.min(1200, rope.len + ROPE_LENGTHEN_RATE * dt);
+  }
+
+  // ── Physics integration ───────────────────────────────────────────────────
+  if (rope.active) {
+    // Pendulum: apply lateral input along the tangent of the rope arc.
+    const toAx = rope.ax - player.x;
+    const toAy = rope.ay - player.y;
+    const rLen  = Math.hypot(toAx, toAy) || 1;
+    const tang  = { x: -toAy / rLen, y: toAx / rLen };
+
+    const left  = keys['KeyA'] || keys['KeyQ'];
+    const right = keys['KeyD'];
+    if (left)  { player.vx -= SWING_FORCE*dt; player.vy += tang.y*SWING_FORCE*dt*Math.sign(-tang.x); }
+    if (right) { player.vx += SWING_FORCE*dt; player.vy += tang.y*SWING_FORCE*dt*Math.sign( tang.x); }
+
+    player.vy += GRAVITY * dt;
+    player.x  += player.vx * dt;
+    player.y  += player.vy * dt;
+
+    // Rope tension constraint — pull player back to rope.len radius
+    const cx = player.x - rope.ax, cy = player.y - rope.ay;
+    const cLen = Math.hypot(cx, cy) || 1;
+    if (cLen > rope.len) {
+      const nx = cx/cLen, ny = cy/cLen;
+      player.x = rope.ax + nx * rope.len;
+      player.y = rope.ay + ny * rope.len;
+      const vDotN = player.vx*nx + player.vy*ny;
+      if (vDotN > 0) { player.vx -= vDotN*nx; player.vy -= vDotN*ny; }
+    }
+
+    resolveCollisions();
+
+    // If a platform blocked retraction, clamp rope.len upward so it doesn't
+    // keep fighting the surface (fixes Z-key tunnelling bug from original).
+    const actualLen = Math.hypot(player.x - rope.ax, player.y - rope.ay);
+    if (actualLen > rope.len) rope.len = actualLen;
+
+  } else {
+    // Free flight / ground movement
+    if (jumpBuffered && player.onGround) {
+      player.vy    = JUMP_FORCE;
+      player.onGround = false;
+    }
+    jumpBuffered = false;
+
+    const left  = keys['KeyA'] || keys['KeyQ'];
+    const right = keys['KeyD'];
+    const accel = player.onGround ? GROUND_ACCEL : AIR_CONTROL;
+    if (left)  player.vx -= accel * dt;
+    if (right) player.vx += accel * dt;
+
+    if (player.onGround) {
+      player.vx = Math.max(-MAX_RUN_SPEED, Math.min(MAX_RUN_SPEED, player.vx));
+      player.vx *= Math.pow(GROUND_FRICTION, dt * 60);
+    } else {
+      player.vx *= Math.pow(AIR_DAMPING, dt * 60);
+    }
+
+    player.vy += GRAVITY * dt;
+    if (player.vy > MAX_FALL_SPEED) player.vy = MAX_FALL_SPEED;
+
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    resolveCollisions();
+  }
+
+  // Safety clamp — keeps player inside world bounds even on edge tunnelling
+  player.x = Math.max(PLAYER_SIZE/2,
+              Math.min(LEVEL_DATA.worldWidth - PLAYER_SIZE/2, player.x));
+
+  // ── Camera — smooth follow, clamped to world bounds ───────────────────────
+  const targetCamX = player.x - canvas.width / 2;
+  camera.x += (targetCamX - camera.x) * Math.min(1, dt * 10);
+  camera.x  = Math.max(0, Math.min(LEVEL_DATA.worldWidth - canvas.width, camera.x));
+
+  // ── Death zone checks ─────────────────────────────────────────────────────
+  // (a) Fell through the world floor
+  if (player.y > DEATH_Y) {
+    hurtPlayer(1);
+    respawnPlayer();
+  }
+  // (b) Stepped into a marked pit rectangle
+  for (const dz of deathZones) {
+    if (rectContains(dz, player.x, player.y)) {
+      hurtPlayer(1);
+      respawnPlayer();
+      break;
+    }
+  }
+
+  // ── Shooting ──────────────────────────────────────────────────────────────
+  player.shootTimer -= dt;
+  player.invTimer   -= dt;
+
+  if (mouse.left && player.shootTimer <= 0 && currentAmmo > 0) {
+    player.shootTimer = SHOOT_COOLDOWN;
+    const dx = mouseWorld.x - player.x;
+    const dy = mouseWorld.y - player.y;
+    const len = Math.hypot(dx, dy) || 1;
+    bullets.push({
+      x: player.x, y: player.y,
+      vx: dx/len * BULLET_SPEED, vy: dy/len * BULLET_SPEED,
+      life: 1.5
+    });
+    currentAmmo--;
+  }
+
+  // ── Player bullets ────────────────────────────────────────────────────────
+  bullets = bullets.filter(b => {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0) return false;
+
+    for (const p of platforms) {
+      if (rectContains(p, b.x, b.y)) {
+        spawnParticles(b.x, b.y, '#ffaa00', 5);
+        return false;
+      }
+    }
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      if (Math.hypot(b.x - e.x, b.y - e.y) < e.size) {
+        e.hp--;
+        spawnParticles(e.x, e.y, '#ff4444', 6);
+        if (e.hp <= 0) {
+          spawnParticles(e.x, e.y, '#ff0000', 14);
+          enemies.splice(i, 1);
+          score++;
+        }
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // ── Enemy bullets ─────────────────────────────────────────────────────────
+  enemyBullets = enemyBullets.filter(b => {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0) return false;
+
+    for (const p of platforms) {
+      if (rectContains(p, b.x, b.y)) {
+        spawnParticles(b.x, b.y, '#ff6600', 3);
+        return false;
+      }
+    }
+    if (Math.hypot(b.x - player.x, b.y - player.y) < PLAYER_SIZE) {
+      hurtPlayer(1);
+      return false;
+    }
+    return true;
+  });
+
+  // ── Enemy AI ──────────────────────────────────────────────────────────────
+  for (const e of enemies) {
+    // Gravity (patrol and static alike)
+    e.vy += GRAVITY * dt;
+    if (e.vy > MAX_FALL_SPEED) e.vy = MAX_FALL_SPEED;
+
+    // Patrol: bounce within range
+    if (e.type === 'patrol') {
+      if (e.x > e.startX + e.patrolRange) e.vx = -Math.abs(e.vx);
+      if (e.x < e.startX - e.patrolRange) e.vx =  Math.abs(e.vx);
+      e.x += e.vx * dt;
+    }
+
+    e.y += e.vy * dt;
+
+    // Land on platforms
+    e.onGround = false;
+    for (const p of platforms) {
+      if (aabbOverlap(e.x - e.size/2, e.y - e.size/2, e.size, e.size,
+                      p.x, p.y, p.w, p.h)) {
+        const ot = (e.y - e.size/2 + e.size) - p.y;
+        const ob = (p.y + p.h) - (e.y - e.size/2);
+        if (ot > 0 && ot < e.size && ot < ob) {
+          e.y -= ot; e.vy = 0; e.onGround = true;
+        }
+      }
+    }
+
+    // Static enemy: shoot at player when in range
+    if (e.type === 'static') {
+      e.shootTimer -= dt;
+      if (e.shootTimer <= 0 &&
+          Math.hypot(e.x - player.x, e.y - player.y) < ENEMY_SHOOT_RANGE) {
+        e.shootTimer = ENEMY_SHOOT_CD;
+        const dx = player.x - e.x, dy = player.y - e.y;
+        const len = Math.hypot(dx, dy) || 1;
+        enemyBullets.push({
+          x: e.x, y: e.y,
+          vx: dx/len * ENEMY_BULLET_SPEED,
+          vy: dy/len * ENEMY_BULLET_SPEED,
+          life: 3.5
+        });
+      }
+    }
+
+    // Patrol enemy: contact damage
+    if (e.type === 'patrol' &&
+        Math.hypot(e.x - player.x, e.y - player.y) < e.size + PLAYER_SIZE/2) {
+      hurtPlayer(1);
+    }
+  }
+
+  // ── Pickups ───────────────────────────────────────────────────────────────
+  for (const p of pickups) {
+    p.bob += dt;
+    if (!p.active) continue;
+    if (Math.hypot(p.x - player.x, p.y - player.y) < PICKUP_RADIUS) {
+      p.active = false;
+      if (p.type === 'ammo') {
+        currentAmmo  = Math.min(currentAmmo  + 10, 99);
+        spawnParticles(p.x, p.y, '#ffff44', 10);
+      } else {
+        currentRopes = Math.min(currentRopes + 3,   9);
+        spawnParticles(p.x, p.y, '#44ffaa', 10);
+      }
+    }
+  }
+
+  // ── Goal ──────────────────────────────────────────────────────────────────
+  if (goal && aabbOverlap(player.x - PLAYER_SIZE/2, player.y - PLAYER_SIZE/2,
+                           PLAYER_SIZE, PLAYER_SIZE,
+                           goal.x, goal.y, goal.w, goal.h)) {
+    levelWon = true;
+  }
+
+  // ── Particles ─────────────────────────────────────────────────────────────
+  particles = particles.filter(p => {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += GRAVITY * 0.3 * dt;
+    p.life -= dt;
+    return p.life > 0;
+  });
+
+  draw();
+  requestAnimationFrame(update);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 8  RENDERER
+//
+//  Draw order:
+//    background (screen-space)
+//    ctx.translate(-camera.x, 0)   ← enter world-space
+//      death zones → platforms → goal → pickups →
+//      rope → particles → enemy bullets → enemies → player bullets → player
+//    ctx.restore()                 ← back to screen-space
+//    HUD → minimap → crosshair → overlays
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Precomputed star positions (deterministic, spans full world width)
+const STARS = Array.from({ length: 90 }, (_, i) => ({
+  x: (i * 137 + 17) % LEVEL_DATA.worldWidth,
+  y: (i * 251 + 31) % 320,
+  s: 0.5 + (i % 3) * 0.5,
+}));
+
+function draw() {
+  // ── Sky background ─────────────────────────────────────────────────────
+  const bg = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  bg.addColorStop(0, '#060612');
+  bg.addColorStop(1, '#131326');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Stars with 20 % parallax scroll
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  for (const st of STARS) {
+    const sx = ((st.x - camera.x * 0.2) % LEVEL_DATA.worldWidth + LEVEL_DATA.worldWidth) % LEVEL_DATA.worldWidth;
+    if (sx >= 0 && sx < canvas.width) ctx.fillRect(sx, st.y, st.s, st.s);
+  }
+
+  // ── Enter world-space ──────────────────────────────────────────────────
+  ctx.save();
+  ctx.translate(-camera.x, 0);
+
+  // ── Death zones ─────────────────────────────────────────────────────────
+  for (const dz of deathZones) {
+    if (dz.x + dz.w < camera.x || dz.x > camera.x + canvas.width) continue;
+    const grd = ctx.createLinearGradient(dz.x, dz.y, dz.x, dz.y + dz.h);
+    grd.addColorStop(0, 'rgba(200,0,0,0.55)');
+    grd.addColorStop(1, 'rgba(50,0,0,0.90)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(dz.x, dz.y, dz.w, dz.h);
+    // Lava chevron lines
+    ctx.strokeStyle = 'rgba(255,80,0,0.35)';
+    ctx.lineWidth = 1;
+    for (let lx = dz.x; lx < dz.x + dz.w; lx += 22) {
+      ctx.beginPath();
+      ctx.moveTo(lx, dz.y);
+      ctx.lineTo(lx + 11, dz.y + dz.h);
+      ctx.stroke();
+    }
+  }
+
+  // ── Platforms ───────────────────────────────────────────────────────────
+  for (const p of platforms) {
+    if (p.x + p.w < camera.x || p.x > camera.x + canvas.width) continue;
+
+    const isWall  = p.w <= 20 && p.h > 200;
+    const isFloor = p.h >= 30 && p.w > 200;
+
+    ctx.save();
+    ctx.shadowColor = isWall ? '#3355cc' : '#4488ff';
+    ctx.shadowBlur  = isFloor ? 8 : isWall ? 5 : 14;
+
+    const gr = ctx.createLinearGradient(p.x, p.y, p.x, p.y + p.h);
+    if (isWall) {
+      gr.addColorStop(0, '#1a2a55'); gr.addColorStop(1, '#0d1833');
+    } else if (isFloor) {
+      gr.addColorStop(0, '#3355aa'); gr.addColorStop(1, '#223366');
+    } else {
+      gr.addColorStop(0, '#557799'); gr.addColorStop(1, '#334455');
+    }
+
+    ctx.fillStyle   = gr;
+    ctx.strokeStyle = isWall ? '#334488' : '#66aaff';
+    ctx.lineWidth   = isWall ? 1 : 1.5;
+    roundRect(p.x, p.y, p.w, p.h, isWall ? 0 : 4);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── Goal portal ─────────────────────────────────────────────────────────
+  if (goal) {
+    const pulse = 0.6 + 0.4 * Math.sin(totalTime * 3);
+    ctx.save();
+    ctx.shadowColor = '#00ffaa';
+    ctx.shadowBlur  = 28 * pulse;
+    const gg = ctx.createLinearGradient(goal.x, goal.y, goal.x, goal.y + goal.h);
+    gg.addColorStop(0, `rgba(0,255,170,${0.28 * pulse})`);
+    gg.addColorStop(1, `rgba(0,160,90,${0.60 * pulse})`);
+    ctx.fillStyle   = gg;
+    ctx.strokeStyle = '#00ffaa';
+    ctx.lineWidth   = 2;
+    roundRect(goal.x, goal.y, goal.w, goal.h, 8);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = `rgba(200,255,230,${0.85 * pulse})`;
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+    ctx.shadowBlur = 8;
+    ctx.fillText('FINISH', goal.x + goal.w/2, goal.y + goal.h/2 + 4);
+    ctx.restore();
+  }
+
+  // ── Pickups ──────────────────────────────────────────────────────────────
+  for (const p of pickups) {
+    if (!p.active) continue;
+    if (p.x + 20 < camera.x || p.x - 20 > camera.x + canvas.width) continue;
+
+    const bobY = Math.sin(p.bob * 2.5) * 4;
+    ctx.save();
+
+    if (p.type === 'ammo') {
+      ctx.shadowColor = '#ffee44'; ctx.shadowBlur = 14;
+      ctx.fillStyle   = '#ffee44'; ctx.strokeStyle = '#bb7700';
+      ctx.lineWidth   = 1.5;
+      roundRect(p.x - 10, p.y - 8 + bobY, 20, 16, 3);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#664400';
+      ctx.font = '8px monospace'; ctx.textAlign = 'center';
+      ctx.shadowBlur = 0;
+      ctx.fillText('AMMO', p.x, p.y + 4 + bobY);
+    } else {
+      ctx.shadowColor = '#44ffaa'; ctx.shadowBlur = 14;
+      ctx.fillStyle   = '#22cc88'; ctx.strokeStyle = '#00ffaa';
+      ctx.lineWidth   = 1.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y + bobY, 10, 0, Math.PI*2);
+      ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#005533'; ctx.lineWidth = 1; ctx.shadowBlur = 0;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y + bobY, 5, 0, Math.PI*2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ── Rope ─────────────────────────────────────────────────────────────────
+  if (rope.active) {
+    ctx.save();
+    ctx.strokeStyle = '#ffdd44'; ctx.lineWidth = 2.5;
+    ctx.shadowColor = '#ffdd44'; ctx.shadowBlur = 6;
+    ctx.setLineDash([8, 4]);
+    ctx.beginPath();
+    ctx.moveTo(player.x, player.y);
+    ctx.lineTo(rope.ax,  rope.ay);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Anchor dot
+    ctx.fillStyle = '#ff8800'; ctx.shadowColor = '#ff8800'; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(rope.ax, rope.ay, 5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Particles ────────────────────────────────────────────────────────────
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle   = p.color; ctx.shadowColor = p.color; ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * alpha, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Enemy bullets ─────────────────────────────────────────────────────────
+  for (const b of enemyBullets) {
+    ctx.save();
+    ctx.fillStyle   = '#ff6600'; ctx.shadowColor = '#ff4400'; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Enemies ───────────────────────────────────────────────────────────────
+  for (const e of enemies) {
+    if (e.x + e.size < camera.x || e.x - e.size > camera.x + canvas.width) continue;
+
+    ctx.save();
+    ctx.shadowColor = e.type === 'static' ? '#ff9900' : '#ff3300';
+    ctx.shadowBlur  = 12;
+
+    // Body
+    ctx.fillStyle = e.type === 'static' ? '#994400' : '#cc2200';
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.size/2, 0, Math.PI*2);
+    ctx.fill();
+
+    // Eye (static faces player; patrol faces movement direction)
+    const eyeDir = e.type === 'static'
+      ? (player.x < e.x ? -1 : 1)
+      : (e.vx < 0 ? -1 : 1);
+    ctx.fillStyle = '#ffcc00'; ctx.shadowBlur = 4;
+    ctx.beginPath(); ctx.arc(e.x + eyeDir*5, e.y - 3, 4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(e.x + eyeDir*6, e.y - 3, 2, 0, Math.PI*2); ctx.fill();
+
+    // HP bar
+    const bw = e.size * 1.4;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#330000'; ctx.fillRect(e.x - bw/2, e.y - e.size/2 - 9, bw, 4);
+    ctx.fillStyle = e.type === 'static' ? '#ff8800' : '#ff2200';
+    ctx.fillRect(e.x - bw/2, e.y - e.size/2 - 9, bw * (e.hp / e.maxHp), 4);
+    ctx.restore();
+  }
+
+  // ── Player bullets ────────────────────────────────────────────────────────
+  for (const b of bullets) {
+    ctx.save();
+    ctx.fillStyle = '#ffff66'; ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Player ────────────────────────────────────────────────────────────────
+  const flash = player.invTimer > 0 && Math.floor(player.invTimer * 8) % 2 === 0;
+  if (!flash) {
+    ctx.save();
+    ctx.shadowColor = '#00ccff'; ctx.shadowBlur = 16;
+
+    // Body
+    ctx.fillStyle = '#0088cc';
+    ctx.beginPath(); ctx.arc(player.x, player.y, PLAYER_SIZE/2, 0, Math.PI*2); ctx.fill();
+
+    // Headband
+    ctx.fillStyle = '#cc0022';
+    ctx.fillRect(player.x - PLAYER_SIZE/2, player.y - PLAYER_SIZE/2 + 2, PLAYER_SIZE, 5);
+
+    // Eye — points toward world mouse
+    const edx = mouseWorld.x - player.x, edy = mouseWorld.y - player.y;
+    const elen = Math.hypot(edx, edy) || 1;
+    const ex = player.x + edx/elen * 5, ey = player.y + edy/elen * 3;
+    ctx.fillStyle = '#ffffff'; ctx.shadowBlur = 0;
+    ctx.beginPath(); ctx.arc(ex, ey, 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000033';
+    ctx.beginPath(); ctx.arc(ex + 0.5, ey + 0.5, 1.5, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Exit world-space ──────────────────────────────────────────────────────
+  ctx.restore();
+
+  // ── Screen-space overlays ─────────────────────────────────────────────────
+  drawHUD();
+  drawMinimap();
+  drawCrosshair(mouse.x, mouse.y);
+  if (gameOver) drawGameOver();
+  if (levelWon) drawLevelWon();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 9  HUD & OVERLAYS  (all drawn in screen-space after camera restore)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function drawHUD() {
+  ctx.save();
+
+  // Panel backdrop
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(8, 8, 226, 96, 8);
+  ctx.fill();
+
+  ctx.textAlign = 'left';
+
+  // HP hearts
+  const hearts = '♥'.repeat(Math.max(0, player.hp)) + '♡'.repeat(Math.max(0, 3 - player.hp));
+  ctx.font = '14px monospace';
+  ctx.fillStyle = '#ff4466'; ctx.shadowColor = '#ff0033'; ctx.shadowBlur = 8;
+  ctx.fillText('HP  ' + hearts, 18, 32);
+
+  // Ammo row
+  const ammoColor = currentAmmo > 5 ? '#ffee44' : '#ff6600';
+  ctx.font = '13px monospace';
+  ctx.fillStyle = ammoColor; ctx.shadowColor = ammoColor; ctx.shadowBlur = 6;
+  ctx.fillText(`AMMO  ${currentAmmo}`, 18, 56);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#333'; ctx.fillRect(108, 45, 100, 7);
+  ctx.fillStyle = ammoColor;
+  ctx.fillRect(108, 45, Math.max(0, 100 * (currentAmmo / START_AMMO)), 7);
+
+  // Rope row
+  const ropeColor = currentRopes > 1 ? '#44ffaa' : '#ff6600';
+  ctx.fillStyle = ropeColor; ctx.shadowColor = ropeColor; ctx.shadowBlur = 6;
+  ctx.fillText(`ROPE  ${currentRopes}`, 18, 78);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#333'; ctx.fillRect(108, 67, 100, 7);
+  ctx.fillStyle = ropeColor;
+  ctx.fillRect(108, 67, Math.max(0, 100 * (currentRopes / START_ROPES)), 7);
+
+  // Score (top-right)
+  ctx.fillStyle = '#ffffff'; ctx.shadowColor = '#8888ff'; ctx.shadowBlur = 4;
+  ctx.textAlign = 'right'; ctx.font = '13px monospace';
+  ctx.fillText('SCORE  ' + score, canvas.width - 10, 26);
+
+  // Empty-resource warnings
+  ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center'; ctx.shadowBlur = 0;
+  if (currentAmmo  === 0) { ctx.fillStyle = '#ff6622'; ctx.fillText('NO AMMO!', 120,  96); }
+  if (currentRopes === 0) { ctx.fillStyle = '#ff6622'; ctx.fillText('NO ROPE!', 120, 112); }
+
+  ctx.restore();
+}
+
+// Minimap — small overview in the bottom-right corner
+function drawMinimap() {
+  const MW = 164, MH = 52;
+  const mx = canvas.width  - MW - 8;
+  const my = canvas.height - MH - 8;
+  const sx = MW / LEVEL_DATA.worldWidth;
+  const sy = MH / LEVEL_DATA.worldHeight;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.60)'; ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
+  roundRect(mx, my, MW, MH, 4); ctx.fill(); ctx.stroke();
+
+  // Platforms
+  ctx.fillStyle = '#446688';
+  for (const p of platforms) {
+    ctx.fillRect(mx + p.x*sx, my + p.y*sy, Math.max(1, p.w*sx), Math.max(1, p.h*sy));
+  }
+  // Death zones
+  ctx.fillStyle = 'rgba(200,0,0,0.5)';
+  for (const dz of deathZones) {
+    ctx.fillRect(mx + dz.x*sx, my + dz.y*sy, Math.max(1, dz.w*sx), Math.max(1, dz.h*sy));
+  }
+  // Goal
+  if (goal) {
+    ctx.fillStyle = 'rgba(0,255,150,0.7)';
+    ctx.fillRect(mx + goal.x*sx, my + goal.y*sy, Math.max(2, goal.w*sx), Math.max(2, goal.h*sy));
+  }
+  // Enemies
+  ctx.fillStyle = '#ff4422';
+  for (const e of enemies) {
+    ctx.fillRect(mx + e.x*sx - 1, my + e.y*sy - 1, 2, 2);
+  }
+  // Player dot
+  ctx.fillStyle = '#00ccff';
+  ctx.beginPath();
+  ctx.arc(mx + player.x*sx, my + player.y*sy, 2.5, 0, Math.PI*2);
+  ctx.fill();
+  // Viewport rect
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 0.5;
+  ctx.strokeRect(mx + camera.x*sx, my, canvas.width*sx, MH);
+
+  ctx.restore();
+}
+
+function drawCrosshair(x, y) {
+  const size  = 14, gap = 4;
+  const color = (mouse.left && currentAmmo > 0) ? '#ff6600'
+              : currentAmmo === 0               ? '#555555'
+                                                : '#00ffcc';
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.shadowColor = color; ctx.shadowBlur = 10; ctx.lineCap = 'round';
+
+  ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI*2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - size - gap, y); ctx.lineTo(x - gap, y);
+  ctx.moveTo(x + gap, y);        ctx.lineTo(x + size + gap, y);
+  ctx.moveTo(x, y - size - gap); ctx.lineTo(x, y - gap);
+  ctx.moveTo(x, y + gap);        ctx.lineTo(x, y + size + gap);
+  ctx.stroke();
+
+  ctx.fillStyle = color; ctx.shadowBlur = 6;
+  ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI*2); ctx.fill();
+
+  // Diagonal tick marks
+  ctx.lineWidth = 1.5; ctx.shadowBlur = 4;
+  [[1,1],[1,-1],[-1,1],[-1,-1]].forEach(([sx, sy]) => {
+    const d = size * 0.65;
+    ctx.beginPath();
+    ctx.moveTo(x + sx*(d-3), y + sy*(d-3));
+    ctx.lineTo(x + sx*(d+3), y + sy*(d+3));
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function drawGameOver() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff4444'; ctx.font = 'bold 64px monospace';
+  ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 24;
+  ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2 - 30);
+  ctx.fillStyle = '#ffffff'; ctx.font = '22px monospace'; ctx.shadowBlur = 0;
+  ctx.fillText('Score: ' + score, canvas.width/2, canvas.height/2 + 20);
+  ctx.fillText('SPACE / ENTER to restart', canvas.width/2, canvas.height/2 + 58);
+  ctx.restore();
+}
+
+function drawLevelWon() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,8,0,0.78)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#00ffaa'; ctx.font = 'bold 56px monospace';
+  ctx.shadowColor = '#00ffaa'; ctx.shadowBlur = 30;
+  ctx.fillText('LEVEL CLEAR!', canvas.width/2, canvas.height/2 - 44);
+  ctx.shadowBlur = 0; ctx.fillStyle = '#ffffff'; ctx.font = '22px monospace';
+  ctx.fillText('Score: ' + score, canvas.width/2, canvas.height/2 + 12);
+  const m = Math.floor(totalTime/60);
+  const s = Math.floor(totalTime % 60).toString().padStart(2, '0');
+  ctx.fillText(`Time: ${m}:${s}`, canvas.width/2, canvas.height/2 + 48);
+  ctx.fillStyle = '#aaffcc';
+  ctx.fillText('SPACE / ENTER to play again', canvas.width/2, canvas.height/2 + 90);
+  ctx.restore();
+}
+
+// Shared rounded-rect path helper (does NOT stroke/fill — caller does that)
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y); ctx.quadraticCurveTo(x+w, y,   x+w, y+r);
+  ctx.lineTo(x+w, y+h-r);                    ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  ctx.lineTo(x+r, y+h);                      ctx.quadraticCurveTo(x,   y+h, x,   y+h-r);
+  ctx.lineTo(x, y+r);                         ctx.quadraticCurveTo(x,   y,   x+r, y);
+  ctx.closePath();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § 10  BOOTSTRAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+function restartGame() {
+  player.x = SPAWN_X; player.y = SPAWN_Y;
+  player.vx = 0; player.vy = 0;
+  player.onGround = false;
+  player.hp = 3;
+  player.shootTimer = 0;
+  player.invTimer   = 0;
+
+  rope.active = false;
+  jumpBuffered = false;
+  camera.x = 0;
+  lastTime = null;
+
+  bullets = []; enemyBullets = []; particles = [];
+  score = 0; currentAmmo = START_AMMO; currentRopes = START_ROPES;
+  totalTime = 0;
+  gameOver = false; levelWon = false;
+
+  loadLevel();   // re-parse LEVEL_DATA → resets enemies, pickups, etc.
+}
+
+loadLevel();
+requestAnimationFrame(update);
+</script>
+</body>
+</html>
